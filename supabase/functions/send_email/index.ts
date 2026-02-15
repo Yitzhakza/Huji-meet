@@ -1,9 +1,10 @@
 import { serve } from 'https://deno.land/std@0.177.0/http/server.ts';
 import { createClient } from 'https://esm.sh/@supabase/supabase-js@2';
+import { encode as base64Encode } from 'https://deno.land/std@0.177.0/encoding/base64url.ts';
 
 const corsHeaders = {
   'Access-Control-Allow-Origin': '*',
-  'Access-Control-Allow-Headers': 'authorization, x-client-info, apikey, content-type',
+  'Access-Control-Allow-Headers': 'authorization, x-client-info, apikey, content-type, x-google-token',
 };
 
 serve(async (req) => {
@@ -23,14 +24,6 @@ serve(async (req) => {
     if (authError || !user) {
       return new Response(JSON.stringify({ error: 'Unauthorized' }), {
         status: 401,
-        headers: { ...corsHeaders, 'Content-Type': 'application/json' },
-      });
-    }
-
-    const resendKey = Deno.env.get('RESEND_API_KEY');
-    if (!resendKey) {
-      return new Response(JSON.stringify({ error: 'Email service not configured' }), {
-        status: 500,
         headers: { ...corsHeaders, 'Content-Type': 'application/json' },
       });
     }
@@ -62,18 +55,18 @@ serve(async (req) => {
       .single();
 
     if (!summary) {
-      return new Response(JSON.stringify({ error: 'No summary found for this meeting' }), {
+      return new Response(JSON.stringify({ error: 'No summary found for this meeting. Generate a summary first.' }), {
         status: 400,
         headers: { ...corsHeaders, 'Content-Type': 'application/json' },
       });
     }
 
-    // Build email body as HTML
+    // Build email body
     let body = '';
     if (messagePreface) {
-      body += `<p>${messagePreface.replace(/\n/g, '<br>')}</p><hr>`;
+      body += messagePreface + '\n\n---\n\n';
     }
-    body += `<div>${summary.content_md.replace(/\n/g, '<br>')}</div>`;
+    body += summary.content_md;
 
     if (includeTranscript) {
       const { data: segments } = await supabase
@@ -90,35 +83,54 @@ serve(async (req) => {
           return `${m}:${String(s).padStart(2, '0')}`;
         };
 
-        const transcriptHtml = segments
-          .map((s: any) => `<b>[${formatTime(s.start_ms)}] ${s.speaker_label}:</b> ${s.text}`)
-          .join('<br>');
+        const transcriptText = segments
+          .map((s: any) => `[${formatTime(s.start_ms)}] ${s.speaker_label}: ${s.text}`)
+          .join('\n');
 
-        body += `<hr><h3>Full Transcript</h3><div style="font-size:14px">${transcriptHtml}</div>`;
+        body += '\n\n---\n\nFull Transcript:\n\n' + transcriptText;
       }
     }
 
-    // Send via Resend API
-    const resendResponse = await fetch('https://api.resend.com/emails', {
+    // Get Google provider token from header
+    const providerToken = req.headers.get('x-google-token');
+
+    if (!providerToken) {
+      return new Response(JSON.stringify({ error: 'Google access token required. Please sign out and sign in again.' }), {
+        status: 401,
+        headers: { ...corsHeaders, 'Content-Type': 'application/json' },
+      });
+    }
+
+    // Compose MIME email
+    const toHeader = toRecipients.join(', ');
+    const ccHeader = ccRecipients?.length ? ccRecipients.join(', ') : '';
+
+    let rawEmail = `From: ${user.email}\r\n`;
+    rawEmail += `To: ${toHeader}\r\n`;
+    if (ccHeader) {
+      rawEmail += `Cc: ${ccHeader}\r\n`;
+    }
+    rawEmail += `Subject: ${subject}\r\n`;
+    rawEmail += `Content-Type: text/plain; charset=UTF-8\r\n`;
+    rawEmail += `\r\n`;
+    rawEmail += body;
+
+    const encodedMessage = base64Encode(new TextEncoder().encode(rawEmail));
+
+    // Send via Gmail API
+    const gmailResponse = await fetch('https://gmail.googleapis.com/gmail/v1/users/me/messages/send', {
       method: 'POST',
       headers: {
-        'Authorization': `Bearer ${resendKey}`,
+        'Authorization': `Bearer ${providerToken}`,
         'Content-Type': 'application/json',
       },
-      body: JSON.stringify({
-        from: 'Huji Meet <onboarding@resend.dev>',
-        to: toRecipients,
-        cc: ccRecipients?.length ? ccRecipients : undefined,
-        subject,
-        html: body,
-        reply_to: user.email,
-      }),
+      body: JSON.stringify({ raw: encodedMessage }),
     });
 
     const emailLogId = crypto.randomUUID();
 
-    if (!resendResponse.ok) {
-      const errorText = await resendResponse.text();
+    if (!gmailResponse.ok) {
+      const errorText = await gmailResponse.text();
       await supabase.from('email_logs').insert({
         id: emailLogId,
         meeting_id: meetingId,

@@ -79,5 +79,12 @@ export async function sendEmail(params: {
   messagePreface?: string;
   includeTranscript: boolean;
 }): Promise<SendEmailResponse> {
-  return invokeEdgeFunction<SendEmailResponse>('send_email', params);
+  const { data: { session } } = await supabase.auth.getSession();
+  const googleToken = session?.provider_token;
+
+  return invokeEdgeFunction<SendEmailResponse>(
+    'send_email',
+    params,
+    googleToken ? { 'x-google-token': googleToken } : undefined,
+  );
 }

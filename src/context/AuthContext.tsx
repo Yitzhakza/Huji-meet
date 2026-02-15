@@ -56,6 +56,7 @@ export function AuthProvider({ children }: { children: ReactNode }) {
     await supabase.auth.signInWithOAuth({
       provider: 'google',
       options: {
+        scopes: 'https://www.googleapis.com/auth/gmail.send',
         redirectTo: window.location.origin + import.meta.env.BASE_URL,
       },
     });
