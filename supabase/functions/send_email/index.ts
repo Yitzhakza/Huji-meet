@@ -1,6 +1,5 @@
 import { serve } from 'https://deno.land/std@0.177.0/http/server.ts';
 import { createClient } from 'https://esm.sh/@supabase/supabase-js@2';
-import { encode as base64Encode } from 'https://deno.land/std@0.177.0/encoding/base64url.ts';
 
 const corsHeaders = {
   'Access-Control-Allow-Origin': '*',
@@ -28,16 +27,10 @@ serve(async (req) => {
       });
     }
 
-    // Check if Gmail sending is enabled
-    const { data: settings } = await supabase
-      .from('app_settings')
-      .select('gmail_sending_enabled')
-      .eq('id', 1)
-      .single();
-
-    if (!settings?.gmail_sending_enabled) {
-      return new Response(JSON.stringify({ error: 'Email sending is disabled' }), {
-        status: 403,
+    const resendKey = Deno.env.get('RESEND_API_KEY');
+    if (!resendKey) {
+      return new Response(JSON.stringify({ error: 'Email service not configured' }), {
+        status: 500,
         headers: { ...corsHeaders, 'Content-Type': 'application/json' },
       });
     }
@@ -75,12 +68,12 @@ serve(async (req) => {
       });
     }
 
-    // Build email body
+    // Build email body as HTML
     let body = '';
     if (messagePreface) {
-      body += messagePreface + '\n\n---\n\n';
+      body += `<p>${messagePreface.replace(/\n/g, '<br>')}</p><hr>`;
     }
-    body += summary.content_md;
+    body += `<div>${summary.content_md.replace(/\n/g, '<br>')}</div>`;
 
     if (includeTranscript) {
       const { data: segments } = await supabase
@@ -97,61 +90,35 @@ serve(async (req) => {
           return `${m}:${String(s).padStart(2, '0')}`;
         };
 
-        const transcriptText = segments
-          .map((s: any) => `[${formatTime(s.start_ms)}] ${s.speaker_label}: ${s.text}`)
-          .join('\n');
+        const transcriptHtml = segments
+          .map((s: any) => `<b>[${formatTime(s.start_ms)}] ${s.speaker_label}:</b> ${s.text}`)
+          .join('<br>');
 
-        body += '\n\n---\n\nFull Transcript:\n\n' + transcriptText;
+        body += `<hr><h3>Full Transcript</h3><div style="font-size:14px">${transcriptHtml}</div>`;
       }
     }
 
-    // Get the user's Google provider token for Gmail API
-    // We need to get it from the user's session
-    const { data: sessionData } = await supabase.auth.admin.getUserById(user.id);
-
-    // The provider token should be passed from the client or stored
-    // For now, we'll use the session's provider_token
-    // The client must pass the provider_token
-    const providerToken = req.headers.get('x-google-token');
-
-    if (!providerToken) {
-      // Try to get from identities
-      return new Response(JSON.stringify({ error: 'Google access token required. Please re-authenticate.' }), {
-        status: 401,
-        headers: { ...corsHeaders, 'Content-Type': 'application/json' },
-      });
-    }
-
-    // Compose MIME email
-    const toHeader = toRecipients.join(', ');
-    const ccHeader = ccRecipients?.length ? ccRecipients.join(', ') : '';
-
-    let rawEmail = `From: ${user.email}\r\n`;
-    rawEmail += `To: ${toHeader}\r\n`;
-    if (ccHeader) {
-      rawEmail += `Cc: ${ccHeader}\r\n`;
-    }
-    rawEmail += `Subject: ${subject}\r\n`;
-    rawEmail += `Content-Type: text/plain; charset=UTF-8\r\n`;
-    rawEmail += `\r\n`;
-    rawEmail += body;
-
-    const encodedMessage = base64Encode(new TextEncoder().encode(rawEmail));
-
-    // Send via Gmail API
-    const gmailResponse = await fetch('https://gmail.googleapis.com/gmail/v1/users/me/messages/send', {
+    // Send via Resend API
+    const resendResponse = await fetch('https://api.resend.com/emails', {
       method: 'POST',
       headers: {
-        'Authorization': `Bearer ${providerToken}`,
+        'Authorization': `Bearer ${resendKey}`,
         'Content-Type': 'application/json',
       },
-      body: JSON.stringify({ raw: encodedMessage }),
+      body: JSON.stringify({
+        from: 'Huji Meet <onboarding@resend.dev>',
+        to: toRecipients,
+        cc: ccRecipients?.length ? ccRecipients : undefined,
+        subject,
+        html: body,
+        reply_to: user.email,
+      }),
     });
 
     const emailLogId = crypto.randomUUID();
 
-    if (!gmailResponse.ok) {
-      const errorText = await gmailResponse.text();
+    if (!resendResponse.ok) {
+      const errorText = await resendResponse.text();
       await supabase.from('email_logs').insert({
         id: emailLogId,
         meeting_id: meetingId,
